@@ -66,8 +66,9 @@ def load_weight(
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     model_folder = download_hf_weight(model_path)
-    files = sorted(glob.glob(f"{model_folder}/*.safetensors"))
-
+    files = glob.glob(f"{model_folder}/*.safetensors")
+    # Prefer HF-format shards over Mistral-native consolidated format
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
     r, n = tp_info.rank, tp_info.size
     tp = n > 1
@@ -81,8 +82,12 @@ def load_weight(
         load_device = device_str
         with safetensors.safe_open(file, framework="pt", device=load_device) as f:
             for name in f.keys():
+                # Strip multimodal wrapper prefix, skip vision/projector weights
+                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                    continue
                 raw = f.get_tensor(name)
-                tensor = (_shard_tensor(name, raw, r, n, num_kv_heads=num_kv_heads))
+                name = name.removeprefix("language_model.")
+                tensor = _shard_tensor(name, raw, r, n, num_kv_heads=num_kv_heads)
                 del raw
 
                 info = _get_merge_info(name)
