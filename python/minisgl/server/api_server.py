@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -57,15 +57,25 @@ class GenerateRequest(BaseModel):
     ignore_eos: bool = False
 
 
+class ImageURL(BaseModel):
+    url: str
+
+
+class ContentPart(BaseModel):
+    type: Literal["text", "image_url"]
+    text: str | None = None
+    image_url: ImageURL | None = None
+
+
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str
+    content: str | List[ContentPart]
 
 
 class OpenAICompletionRequest(BaseModel):
     """Unified request model for OpenAI-style completions and chat-completions."""
 
-    model: str
+    model: str = "default"
 
     prompt: str | None = None
     messages: List[Message] | None = None
@@ -102,6 +112,7 @@ class FrontendManager:
     config: ServerArgs
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
+    is_multimodal: bool = False
     uid_counter: int = 0
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
@@ -257,10 +268,44 @@ async def v1_root():
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
     if req.messages:
-        prompt = [msg.model_dump() for msg in req.messages]
+        # Check if any message contains image content
+        has_images = False
+        for msg in req.messages:
+            if isinstance(msg.content, list):
+                for part in msg.content:
+                    if part.type == "image_url":
+                        has_images = True
+                        break
+            if has_images:
+                break
+
+        if has_images and not state.is_multimodal:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "This model does not support image inputs.", "type": "invalid_request_error"}},
+            )
+
+        # Build prompt: for multimodal, pass raw messages dicts; for text-only, use chat template
+        prompt = []
+        for msg in req.messages:
+            if isinstance(msg.content, str):
+                prompt.append({"role": msg.role, "content": msg.content})
+            else:
+                # Convert ContentPart list to plain dicts
+                content_parts = []
+                for part in msg.content:
+                    if part.type == "text":
+                        content_parts.append({"type": "text", "text": part.text or ""})
+                    elif part.type == "image_url" and part.image_url is not None:
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": part.image_url.url},
+                        })
+                prompt.append({"role": msg.role, "content": content_parts})
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
+        has_images = False
 
     # TODO: support more sampling parameters
     uid = state.new_user()
@@ -275,6 +320,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            is_multimodal=has_images,
         )
     )
 
@@ -400,7 +446,7 @@ async def shell():
             child.kill()
 
 
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool, is_multimodal: bool = False) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -409,6 +455,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         start_backend: Callback that launches the backend worker processes (TP schedulers +
             tokenizer/detokenizer).
         run_shell: If True, run an interactive terminal shell instead of starting uvicorn.
+        is_multimodal: Whether the loaded model supports multimodal inputs.
     """
 
     global _GLOBAL_STATE
@@ -432,6 +479,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
             create=config.frontend_create_tokenizer_link,
             encoder=BaseTokenizerMsg.encoder,
         ),
+        is_multimodal=is_multimodal,
     )
 
     # start the backend here

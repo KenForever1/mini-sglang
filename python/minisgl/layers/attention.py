@@ -15,6 +15,14 @@ if TYPE_CHECKING:
     from minisgl.models import RotaryConfig
 
 
+def _make_hashable(d: dict) -> tuple:
+    """Convert a dict to a hashable tuple, recursively converting lists to tuples."""
+    return tuple(
+        (k, tuple(v) if isinstance(v, list) else v)
+        for k, v in d.items()
+    )
+
+
 class AttentionLayer(StateLessOP):
     def __init__(
         self,
@@ -39,7 +47,7 @@ class AttentionLayer(StateLessOP):
             rotary_dim=rotary_config.rotary_dim,
             max_position=rotary_config.max_position,
             base=rotary_config.base,
-            rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
+            rope_scaling=_make_hashable(rotary_config.scaling) if rotary_config.scaling else None,
         )
         self.q_norm = q_norm
         self.k_norm = k_norm
@@ -52,6 +60,11 @@ class AttentionLayer(StateLessOP):
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        # MRoPE torch path produces contiguous k (from torch.cat+reshape) while v
+        # remains a non-contiguous view from split. The store kernel requires k and
+        # v to have matching strides, so make v contiguous when they diverge.
+        if k.stride() != v.stride():
+            v = v.contiguous()
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return o.view(-1, self.qo_attn_dim)

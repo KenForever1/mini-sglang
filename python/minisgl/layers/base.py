@@ -4,6 +4,7 @@ from abc import abstractmethod
 from typing import Any, Dict, Generic, List, TypeAlias, TypeVar
 
 import torch
+import torch.nn as nn
 
 _STATE_DICT: TypeAlias = Dict[str, torch.Tensor]
 
@@ -26,6 +27,10 @@ class BaseOP:
                 result[_concat_prefix(prefix, name)] = param
             elif isinstance(param, BaseOP):
                 param.state_dict(prefix=_concat_prefix(prefix, name), result=result)
+            elif isinstance(param, nn.Module):
+                sub_prefix = _concat_prefix(prefix, name)
+                for k, v in param.state_dict().items():
+                    result[_concat_prefix(sub_prefix, k)] = v
 
         return result
 
@@ -48,6 +53,14 @@ class BaseOP:
                 param.load_state_dict(
                     state_dict, prefix=_concat_prefix(prefix, name), _internal=True
                 )
+            elif isinstance(param, nn.Module):
+                sub_prefix = _concat_prefix(prefix, name) + "."
+                sub_dict = {
+                    k[len(sub_prefix):]: state_dict.pop(k)
+                    for k in list(state_dict.keys())
+                    if k.startswith(sub_prefix)
+                }
+                param.load_state_dict(sub_dict, strict=True, assign=True)
 
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")

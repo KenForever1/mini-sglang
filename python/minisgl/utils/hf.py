@@ -50,3 +50,9 @@ def download_hf_weight(model_path: str) -> str:
         raise ValueError(
             f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
         )
+
+
+def load_processor(model_path: str):
+    from transformers import AutoProcessor
+
+    return AutoProcessor.from_pretrained(model_path)

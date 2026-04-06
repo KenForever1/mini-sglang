@@ -204,6 +204,21 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
+
+        # Check for multimodal requests
+        batch.has_multimodal = any(
+            getattr(r, "is_multimodal", False) for r in batch.reqs
+        )
+
+        # Aggregate multimodal data for prefill
+        if batch.has_multimodal and batch.is_prefill:
+            pv_list = [r.pixel_values for r in batch.reqs if r.pixel_values is not None]
+            if pv_list:
+                batch.pixel_values = torch.cat(pv_list, dim=0)
+            gt_list = [r.image_grid_thw for r in batch.reqs if r.image_grid_thw is not None]
+            if gt_list:
+                batch.image_grid_thw = torch.cat(gt_list, dim=0)
+
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -234,6 +249,39 @@ class Scheduler(SchedulerIOMixin):
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    has_mrope = getattr(batch, "has_multimodal", False)
+
+    if has_mrope and batch.is_prefill:
+        # MRoPE prefill: concatenate mrope_positions from each request
+        pos_list = []
+        for req in batch.padded_reqs:
+            if req.mrope_positions is not None:
+                # mrope_positions is (3, req_seq_len), slice to extend_len
+                pos = req.mrope_positions[:, req.cached_len : req.device_len]
+                pos_list.append(pos)
+            else:
+                # Fallback: text-only req in a mixed batch, replicate 1D as 3D
+                length = req.extend_len
+                pos_1d = torch.arange(req.cached_len, req.device_len, dtype=torch.int32)
+                pos = pos_1d.unsqueeze(0).expand(3, -1)
+                pos_list.append(pos)
+        positions = torch.cat(pos_list, dim=1).to(torch.int32)
+        return positions.to(device, non_blocking=True)
+
+    if has_mrope and batch.is_decode:
+        # MRoPE decode: each token gets 3 identical positions based on delta
+        positions_list = []
+        for req in batch.padded_reqs:
+            if req.mrope_position_delta is not None:
+                pos_val = req.device_len - 1 + req.mrope_position_delta
+            else:
+                pos_val = req.cached_len
+            pos = torch.full((3, 1), pos_val, dtype=torch.int32)
+            positions_list.append(pos)
+        positions = torch.cat(positions_list, dim=1)
+        return positions.to(device, non_blocking=True)
+
+    # Original 1D positions for text-only batches
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
@@ -250,13 +298,33 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    # positions can be (seq_len,) for 1D or (3, seq_len) for MRoPE
+    num_tokens = batch.positions.shape[-1]
+    mapping_host = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+    mapping_device = mapping_host.to(device, non_blocking=True)
+
+    # For token_pool indexing, always use 1D sequential positions.
+    # MRoPE positions (3, N) are for rotary embeddings, not token storage.
+    if batch.positions.dim() > 1:
+        pos_host = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            torch.arange(
+                req.cached_len, req.device_len, dtype=torch.int64,
+                out=pos_host[offset : offset + length],
+            )
+            offset += length
+        positions = pos_host.to(device, non_blocking=True)
+    else:
+        positions = batch.positions.to(torch.int64)
+
+    return mapping_device, positions
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:

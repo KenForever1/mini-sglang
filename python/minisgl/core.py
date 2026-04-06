@@ -34,6 +34,12 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    # Multimodal fields
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    mrope_positions: torch.Tensor | None = None
+    mrope_position_delta: int | None = None
+    is_multimodal: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -79,6 +85,10 @@ class Batch:
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # Multimodal fields
+    pixel_values: torch.Tensor | None = field(default=None, init=False)
+    image_grid_thw: torch.Tensor | None = field(default=None, init=False)
+    has_multimodal: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:

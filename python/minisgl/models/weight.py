@@ -82,6 +82,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    is_qwen3_vl = config.is_multimodal and config.vision_config is not None
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -89,13 +90,33 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                # Skip rotary_emb.inv_freq (computed from config at runtime)
+                if "rotary_emb.inv_freq" in name:
                     continue
-                raw = f.get_tensor(name)
-                name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
-                del raw
+
+                if is_qwen3_vl:
+                    # Qwen3-VL weight name remapping
+                    is_visual = "visual" in name
+                    raw = f.get_tensor(name)
+                    if "language_model" in name:
+                        name = name.replace("model.language_model.", "model.")
+                    if is_visual:
+                        name = name.replace("model.visual.", "visual.")
+                    if is_visual:
+                        # Vision weights: no TP shard, no merge
+                        yield name, raw
+                        continue
+                    # Language model weights: standard merge + shard
+                    tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                    del raw
+                else:
+                    # Non-VL models: skip vision/projector weights
+                    if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                        continue
+                    raw = f.get_tensor(name)
+                    name = name.removeprefix("language_model.")
+                    tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                    del raw
 
                 if (info := _get_merge_info(name)) is None:
                     out = (name, tensor)

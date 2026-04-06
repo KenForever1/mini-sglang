@@ -55,11 +55,28 @@ class Qwen3Model(BaseOP):
             eps=config.rms_norm_eps,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        deepstack_embeds: torch.Tensor | None = None,
+        deepstack_inject_layers: range | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is not None:
+            x = inputs_embeds
+        else:
+            x = self.embed_tokens.forward(input_ids)
+        hidden_size = x.shape[-1]
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        for layer_idx, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+            if (
+                deepstack_embeds is not None
+                and deepstack_inject_layers is not None
+                and layer_idx in deepstack_inject_layers
+            ):
+                sep = hidden_size * layer_idx
+                x = x + deepstack_embeds[:, sep : sep + hidden_size]
         return self.norm.forward(x, residual)[0]
 
 

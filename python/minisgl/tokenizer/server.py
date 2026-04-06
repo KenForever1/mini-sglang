@@ -38,6 +38,7 @@ def tokenize_worker(
     local_bs: int,
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
+    is_multimodal: bool = False,
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -47,10 +48,21 @@ def tokenize_worker(
     tokenizer = load_tokenizer(tokenizer_path)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
+    # Load processor and model config for multimodal models
+    processor = None
+    model_config = None
+    if is_multimodal:
+        from minisgl.models.config import ModelConfig
+        from minisgl.utils import cached_load_hf_config, load_processor
+
+        processor = load_processor(tokenizer_path)
+        model_config = ModelConfig.from_hf(cached_load_hf_config(tokenizer_path))
+        logger.info("Loaded multimodal processor for %s", tokenizer_path)
+
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, processor=processor, model_config=model_config)
     detokenize_manager = DetokenizeManager(tokenizer)
 
     if ack_queue is not None:
@@ -85,15 +97,20 @@ def tokenize_worker(
                 send_frontend.put(batch_output)
 
             if len(tokenize_msg) > 0:
-                tensors = tokenize_manager.tokenize(tokenize_msg)
+                tok_results = tokenize_manager.tokenize(tokenize_msg)
                 batch_output = BatchBackendMsg(
                     data=[
                         UserMsg(
                             uid=msg.uid,
-                            input_ids=t,
+                            input_ids=result.input_ids,
                             sampling_params=msg.sampling_params,
+                            pixel_values=result.pixel_values,
+                            image_grid_thw=result.image_grid_thw,
+                            mrope_positions=result.mrope_positions,
+                            mrope_position_delta=result.mrope_position_delta,
+                            is_multimodal=result.is_multimodal,
                         )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
+                        for msg, result in zip(tokenize_msg, tok_results, strict=True)
                     ]
                 )
                 if len(batch_output.data) == 1:

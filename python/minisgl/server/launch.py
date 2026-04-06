@@ -44,6 +44,14 @@ def launch_server(run_shell: bool = False) -> None:
     server_args, run_shell = parse_args(sys.argv[1:], run_shell)
     logger = init_logger(__name__, "initializer")
 
+    # Determine if model is multimodal (needed by both api_server and tokenizer workers)
+    from minisgl.models.config import ModelConfig
+    from minisgl.utils import cached_load_hf_config
+
+    hf_config = cached_load_hf_config(server_args.model_path)
+    model_config = ModelConfig.from_hf(hf_config)
+    is_multimodal = model_config.is_multimodal
+
     def start_subprocess() -> None:
         import multiprocessing as mp
 
@@ -80,6 +88,7 @@ def launch_server(run_shell: bool = False) -> None:
                 "local_bs": 1,
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
+                "is_multimodal": is_multimodal,
                 "ack_queue": ack_queue,
             },
             daemon=False,
@@ -96,6 +105,7 @@ def launch_server(run_shell: bool = False) -> None:
                     "local_bs": 1,
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
+                    "is_multimodal": is_multimodal,
                     "ack_queue": ack_queue,
                 },
                 daemon=False,
@@ -110,7 +120,7 @@ def launch_server(run_shell: bool = False) -> None:
         for _ in range(num_tokenizers + 2):
             logger.info(ack_queue.get())
 
-    run_api_server(server_args, start_subprocess, run_shell=run_shell)
+    run_api_server(server_args, start_subprocess, run_shell=run_shell, is_multimodal=is_multimodal)
 
 
 if __name__ == "__main__":

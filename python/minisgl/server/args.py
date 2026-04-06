@@ -8,7 +8,7 @@ from typing import List, Tuple
 import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
-from minisgl.utils import init_logger
+from minisgl.utils import cached_load_hf_config, init_logger
 
 
 @dataclass(frozen=True)
@@ -249,9 +249,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["model_source"]
 
     if (dtype_str := kwargs["dtype"]) == "auto":
-        from minisgl.utils import cached_load_hf_config
-
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+        dtype_str = hf_config.dtype
+        # VL models (e.g. Qwen3-VL) store torch_dtype in text_config, not top-level
+        if dtype_str is None and hasattr(hf_config, "text_config"):
+            dtype_str = getattr(hf_config.text_config, "dtype", None) or getattr(
+                hf_config.text_config, "torch_dtype", None
+            )
+        if dtype_str is None:
+            dtype_str = torch.bfloat16  # safe default
 
     DTYPE_MAP = {
         "float16": torch.float16,

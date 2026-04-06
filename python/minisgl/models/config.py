@@ -1,6 +1,6 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 from transformers import PretrainedConfig
 
 
@@ -32,6 +32,14 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    # Multimodal fields (VL models)
+    image_token_id: int | None = None
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
+    mrope_section: List[int] | None = None
+    vision_config: Dict[str, Any] | None = None
+    is_multimodal: bool = False
 
     @property
     def is_moe(self) -> bool:
@@ -39,6 +47,27 @@ class ModelConfig:
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+        # Extract multimodal fields before unwrapping text_config
+        image_token_id = getattr(config, "image_token_id", None)
+        video_token_id = getattr(config, "video_token_id", None)
+        vision_start_token_id = getattr(config, "vision_start_token_id", None)
+        vision_end_token_id = getattr(config, "vision_end_token_id", None)
+        vision_config_raw = None
+        if hasattr(config, "vision_config") and config.vision_config is not None:
+            vc = config.vision_config
+            vision_config_raw = vc.to_dict() if hasattr(vc, "to_dict") else dict(vc)
+
+        # Extract mrope_section from rope_scaling
+        top_rope_scaling = getattr(config, "rope_scaling", None)
+        if top_rope_scaling is None and hasattr(config, "text_config"):
+            top_rope_scaling = getattr(config.text_config, "rope_scaling", None)
+        mrope_section = None
+        if top_rope_scaling and "mrope_section" in top_rope_scaling:
+            mrope_section = top_rope_scaling["mrope_section"]
+
+        is_multimodal = image_token_id is not None
+
+        # Unwrap text_config for multimodal models
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
@@ -84,4 +113,11 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+            vision_start_token_id=vision_start_token_id,
+            vision_end_token_id=vision_end_token_id,
+            mrope_section=mrope_section,
+            vision_config=vision_config_raw,
+            is_multimodal=is_multimodal,
         )
