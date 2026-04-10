@@ -223,6 +223,33 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    # ── Tiered KV cache offload ──
+    parser.add_argument(
+        "--cpu-kv-cache-gb",
+        type=float,
+        default=ServerArgs.cpu_kv_cache_gb,
+        help="CPU DRAM allocated for KV cache offload (GB). 0 disables CPU offload.",
+    )
+    parser.add_argument(
+        "--ssd-kv-cache-gb",
+        type=float,
+        default=ServerArgs.ssd_kv_cache_gb,
+        help="SSD space allocated for KV cache offload (GB). 0 disables SSD tier.",
+    )
+    parser.add_argument(
+        "--ssd-kv-cache-path",
+        type=str,
+        default=ServerArgs.ssd_kv_cache_path,
+        help="Path for SSD-backed KV cache memory-mapped file.",
+    )
+    parser.add_argument(
+        "--kv-offload-strategy",
+        type=str,
+        default=ServerArgs.kv_offload_strategy,
+        choices=["per-layer", "all-layer"],
+        help="KV cache offload granularity.",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 

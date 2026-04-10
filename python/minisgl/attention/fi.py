@@ -182,10 +182,35 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
+
+        # Tiered KV cache: wait for prefetch of *this* layer to finish
+        # Skip during CUDA graph capture — CPU↔GPU transfers are forbidden.
+        from minisgl.kvcache.tiered_pool import TieredKVCachePool
+
+        is_tiered = isinstance(self.kvcache, TieredKVCachePool)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if is_tiered and self.kvcache.prefetch_scheduler is not None and not capturing:
+            self.kvcache.prefetch_scheduler.wait_prefetch()
+
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        output = metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+
+        # Tiered KV cache: kick off prefetch for the *next* layer
+        if is_tiered and self.kvcache.prefetch_scheduler is not None and not capturing:
+            next_layer = layer_id + 1
+            if next_layer < self.kvcache.num_layers:
+                page_ids = self._collect_page_ids(batch)
+                self.kvcache.prefetch_scheduler.prefetch_layer(next_layer, page_ids)
+
+        return output
+
+    def _collect_page_ids(self, batch: Batch) -> torch.Tensor:
+        """Gather all logical page-ids referenced by the current batch."""
+        page_table = get_global_ctx().page_table
+        parts = [page_table[req.table_idx, : req.device_len] for req in batch.padded_reqs]
+        return torch.cat(parts)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs

@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .tiered_pool import Tier, TieredCacheConfig, TieredKVCachePool
 
 
 class CacheManagerCreator(Protocol):
@@ -71,4 +72,7 @@ __all__ = [
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",
+    "Tier",
+    "TieredCacheConfig",
+    "TieredKVCachePool",
 ]

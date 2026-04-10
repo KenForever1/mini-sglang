@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 from minisgl.core import Req
 from minisgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from minisgl.utils import div_ceil
+from minisgl.kvcache.tiered_pool import Tier, TieredKVCachePool
+from minisgl.utils import div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
+
+logger = init_logger(__name__)
 
 
 class CacheManager:
@@ -23,6 +27,19 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_table = page_table
         self.page_size = page_size
+        # Optionally linked to tiered KV cache pool for location tracking
+        self._tiered_pool: Optional[TieredKVCachePool] = None
+
+    def set_tiered_pool(self, pool: TieredKVCachePool) -> None:
+        """Attach a tiered KV cache pool for location-table bookkeeping.
+
+        Design invariant: ``page_id == GPU_buffer_offset`` (1:1 permanent
+        mapping).  Cross-tier transfers move *data* but never reassign GPU
+        offsets.  Free pages start with ``tier = -1`` in the LocationTable
+        and are marked ``Tier.GPU`` only when actually allocated for a
+        request (see ``_allocate``).
+        """
+        self._tiered_pool = pool
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
@@ -49,8 +66,70 @@ class CacheManager:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
         if needed_pages > 0:
-            allocated = self._page_to_token(self._allocate(needed_pages))
+            pages = self._allocate(needed_pages)
+            allocated = self._page_to_token(pages)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            # Lock newly-allocated pages to prevent tiered eviction during attention
+            if self._tiered_pool is not None and self._tiered_pool.eviction_policy is not None:
+                self._tiered_pool.eviction_policy.lock_pages(
+                    (pages // self.page_size).cpu()
+                )
+
+    def ensure_batch_on_gpu(self, reqs: List[Req]) -> None:
+        """Ensure every page referenced by *reqs* is physically on GPU.
+
+        When tiered KV-cache is enabled, some prefix-cached pages may have
+        been demoted to CPU or SSD.  This method copies them back to their
+        permanent GPU offset (page_id == GPU_offset invariant) so that the
+        FlashInfer attention kernel receives valid data.
+        """
+        if self._tiered_pool is None:
+            return
+
+        lt = self._tiered_pool.location_table
+
+        for req in reqs:
+            device_len = req.device_len
+            if device_len == 0:
+                continue
+
+            # page_table entries are token indices; with page_size=1, page_id == token_index
+            pt_entries = self.page_table[req.table_idx, :device_len].cpu()
+            page_ids = pt_entries.int() // self.page_size
+
+            tiers, offsets = lt.lookup(page_ids)
+            # -1 means free/untracked – skip those (they belong to freshly allocated pages)
+            off_gpu_mask = (tiers != Tier.GPU.value) & (tiers >= 0)
+
+            if not off_gpu_mask.any():
+                continue
+
+            off_gpu_positions = off_gpu_mask.nonzero(as_tuple=True)[0]
+            off_gpu_page_ids = page_ids[off_gpu_positions]
+            off_gpu_tiers = tiers[off_gpu_positions]
+            off_gpu_offsets = offsets[off_gpu_positions]
+
+            # page_id == GPU_offset: copy data back to the page's own GPU slot.
+            gpu_buf = self._tiered_pool.gpu_pool.buffer
+
+            for i in range(len(off_gpu_page_ids)):
+                pid = off_gpu_page_ids[i].item()
+                src_tier = Tier(off_gpu_tiers[i].item())
+                src_off = off_gpu_offsets[i].item()
+                src_pool = self._tiered_pool.get_pool(src_tier)
+
+                # Copy all layers from source tier back to GPU at offset = page_id
+                if isinstance(src_pool.buffer, np.memmap):
+                    data = torch.from_numpy(np.array(src_pool.buffer[:, :, src_off]))
+                    gpu_buf[:, :, pid].copy_(data)
+                else:
+                    gpu_buf[:, :, pid].copy_(src_pool.buffer[:, :, src_off])
+
+                src_pool.free(torch.tensor([src_off], dtype=torch.int32))
+
+            # Update location table: pages are back on GPU at their permanent offset
+            lt.update(off_gpu_page_ids, Tier.GPU, off_gpu_page_ids.int())
+            lt.touch(off_gpu_page_ids)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         # ==================================== valid cache region ====================================
@@ -102,19 +181,58 @@ class CacheManager:
         finally:
             del self._free
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            if self._tiered_pool is not None and lazy_free_list:
+                all_pages = torch.cat(lazy_free_list)
+                page_ids = (all_pages // self.page_size).cpu()
+                # Mark lazily-freed pages as untracked so eviction ignores them
+                self._tiered_pool.location_table.mark_free(page_ids)
+                if self._tiered_pool.eviction_policy is not None:
+                    self._tiered_pool.eviction_policy.unlock_pages(page_ids)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
             evicted = self.prefix_cache.evict((needed_pages - free_pages) * self.page_size)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+            evicted_pages = evicted[:: self.page_size]
+
+            # Evicted prefix entries may have been demoted to CPU/SSD.
+            # Free their physical storage on the non-GPU tier.
+            if self._tiered_pool is not None:
+                lt = self._tiered_pool.location_table
+                eids = (evicted_pages // self.page_size).cpu()
+                tiers, offsets = lt.lookup(eids)
+                for tier, pool in [
+                    (Tier.CPU, self._tiered_pool.cpu_pool),
+                    (Tier.SSD, self._tiered_pool.ssd_pool),
+                ]:
+                    if pool is None:
+                        continue
+                    mask = tiers == tier.value
+                    if mask.any():
+                        pool.free(offsets[mask])
+                lt.mark_free(eids)
+
+            self.free_slots = torch.cat([self.free_slots, evicted_pages])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
+        # Mark allocated pages as GPU-resident in the location table
+        if self._tiered_pool is not None:
+            page_ids = (allocated // self.page_size).cpu()
+            gpu_offsets = page_ids.int()  # page_id == GPU buffer offset
+            self._tiered_pool.location_table.update(page_ids, Tier.GPU, gpu_offsets)
+            self._tiered_pool.location_table.touch(page_ids)
         return allocated
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
-            self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+            page_indices = indices[:: self.page_size]
+            self.free_slots = torch.cat([self.free_slots, page_indices])
+            if self._tiered_pool is not None:
+                page_ids = (page_indices // self.page_size).cpu()
+                # Mark freed pages as untracked so eviction ignores them
+                self._tiered_pool.location_table.mark_free(page_ids)
+                if self._tiered_pool.eviction_policy is not None:
+                    self._tiered_pool.eviction_policy.unlock_pages(page_ids)
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

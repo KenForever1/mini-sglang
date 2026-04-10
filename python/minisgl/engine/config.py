@@ -29,6 +29,10 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    cpu_kv_cache_gb: float = 0.0         # CPU DRAM for KV cache offload (GB), 0 = disabled
+    ssd_kv_cache_gb: float = 0.0         # SSD for KV cache offload (GB), 0 = disabled
+    ssd_kv_cache_path: str = "/tmp/minisgl_kv_cache"
+    kv_offload_strategy: str = "per-layer"  # "per-layer" or "all-layer"
 
     @cached_property
     def hf_config(self):

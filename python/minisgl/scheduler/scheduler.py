@@ -59,6 +59,12 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
         )
+        # Link tiered pool (if enabled) to cache manager for location tracking
+        from minisgl.kvcache.tiered_pool import TieredKVCachePool
+
+        if isinstance(self.engine.kv_cache, TieredKVCachePool):
+            self.cache_manager.set_tiered_pool(self.engine.kv_cache)
+
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -71,6 +77,10 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
+
+        # Counter for periodic KV cache debug stats
+        self._step_count = 0
+        self._kv_stats_interval = 1  # log every N forward steps
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -205,6 +215,11 @@ class Scheduler(SchedulerIOMixin):
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
 
+        # Tiered KV cache: ensure all prefix-cached pages are on GPU and
+        # page_table entries hold valid GPU buffer offsets before metadata
+        # is built for the attention kernel.
+        self.cache_manager.ensure_batch_on_gpu(batch.reqs)
+
         # Check for multimodal requests
         batch.has_multimodal = any(
             getattr(r, "is_multimodal", False) for r in batch.reqs
@@ -237,7 +252,29 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        if batch is not None:
+            self._step_count += 1
+            if self._step_count % self._kv_stats_interval == 0:
+                self._log_kv_stats(batch)
         return self._prepare_batch(batch) if batch else None
+
+    def _log_kv_stats(self, batch: Batch) -> None:
+        from minisgl.kvcache.tiered_pool import TieredKVCachePool
+
+        kv = self.engine.kv_cache
+        free_pages = len(self.cache_manager.free_slots)
+        cache_info = self.cache_manager.prefix_cache.size_info
+        msg = (
+            f"[KV-step {self._step_count}] "
+            f"batch={batch.phase}(n={len(batch.reqs)}) "
+            f"free_pages={free_pages} "
+            f"prefix_cache(evict={cache_info.evictable_size} "
+            f"prot={cache_info.protected_size} "
+            f"total={cache_info.total_size})"
+        )
+        if isinstance(kv, TieredKVCachePool):
+            msg += f" tiered=[{kv.debug_stats()}]"
+        logger.info_rank0(msg)
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input

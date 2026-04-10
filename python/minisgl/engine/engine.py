@@ -54,13 +54,46 @@ class Engine:
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
+
+        if config.cpu_kv_cache_gb > 0:
+            # Tiered KV cache: GPU + CPU (+ optional SSD)
+            from minisgl.kvcache.eviction import TieredEvictionPolicy
+            from minisgl.kvcache.prefetch import PrefetchScheduler
+            from minisgl.kvcache.tiered_pool import TieredCacheConfig, TieredKVCachePool
+
+            cache_per_page = (
+                2 * config.model_config.head_dim
+                * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                * config.page_size
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+            )
+            cpu_pages = int(config.cpu_kv_cache_gb * 1024**3) // cache_per_page
+            ssd_pages = int(config.ssd_kv_cache_gb * 1024**3) // cache_per_page if config.ssd_kv_cache_gb > 0 else 0
+
+            tiered_cfg = TieredCacheConfig(
+                num_layers=config.model_config.num_layers,
+                num_kv_heads=config.model_config.num_kv_heads,
+                head_dim=config.model_config.head_dim,
+                dtype=self.dtype,
+                gpu_pages=self.num_pages + 1,
+                cpu_pages=cpu_pages,
+                ssd_pages=ssd_pages,
+                ssd_path=config.ssd_kv_cache_path,
+                page_size=config.page_size,
+            )
+            tiered_pool = TieredKVCachePool(tiered_cfg)
+            tiered_pool.eviction_policy = TieredEvictionPolicy(tiered_pool)
+            tiered_pool.prefetch_scheduler = PrefetchScheduler(tiered_pool)
+            self.ctx.kv_cache = self.kv_cache = tiered_pool
+        else:
+            self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+                model_config=config.model_config,
+                num_pages=self.num_pages + 1,  # +1 for dummy page
+                page_size=config.page_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -190,6 +223,14 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+
+        # Tiered KV cache: prefetch Layer 0 before the model starts
+        from minisgl.kvcache.tiered_pool import TieredKVCachePool
+
+        if isinstance(self.kv_cache, TieredKVCachePool) and self.kv_cache.prefetch_scheduler is not None:
+            page_ids = self.attn_backend._collect_page_ids(batch)
+            self.kv_cache.prefetch_scheduler.prefetch_layer(0, page_ids)
+
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
