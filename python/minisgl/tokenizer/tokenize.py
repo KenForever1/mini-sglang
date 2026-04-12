@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Dict, List
 
 import torch
 from minisgl.message import TokenizeMsg
+from minisgl.utils import init_logger, maybe_log_perf
 from transformers import PreTrainedTokenizerBase
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -57,9 +61,17 @@ class TokenizeManager:
     def _tokenize_multimodal(self, msg: TokenizeMsg) -> TokenizeResult:
         from minisgl.multimodal.qwen3_vl_processor import Qwen3VLProcessor
 
+        total_start = time.perf_counter()
         assert isinstance(msg.text, list), "Multimodal messages must be a list of dicts"
         vl_processor = Qwen3VLProcessor(self.processor)
+
+        processor_start = time.perf_counter()
         output = vl_processor.process_messages(msg.text)
+        maybe_log_perf(
+            logger,
+            f"tokenize.multimodal.processor tokens={output.input_ids.numel()}",
+            processor_start,
+        )
 
         # Compute MRoPE positions
         mrope_positions = None
@@ -71,6 +83,7 @@ class TokenizeManager:
         ):
             from minisgl.multimodal.mrope import get_rope_index
 
+            mrope_start = time.perf_counter()
             spatial_merge_size = 2  # default for Qwen3-VL
             if self.model_config.vision_config is not None:
                 spatial_merge_size = self.model_config.vision_config.get(
@@ -83,7 +96,18 @@ class TokenizeManager:
                 vision_start_token_id=self.model_config.vision_start_token_id,
                 spatial_merge_size=spatial_merge_size,
             )
+            maybe_log_perf(
+                logger,
+                f"tokenize.multimodal.mrope image_count={output.image_grid_thw.shape[0]}",
+                mrope_start,
+            )
 
+        num_images = 0 if output.image_grid_thw is None else int(output.image_grid_thw.shape[0])
+        maybe_log_perf(
+            logger,
+            f"tokenize.multimodal.total images={num_images} tokens={output.input_ids.numel()}",
+            total_start,
+        )
         return TokenizeResult(
             input_ids=output.input_ids,
             pixel_values=output.pixel_values,

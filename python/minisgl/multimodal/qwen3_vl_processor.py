@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Dict, List
 
 import torch
 from PIL import Image
+from minisgl.utils import init_logger, maybe_log_perf
 
 from .image_io import load_image
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -35,6 +39,7 @@ class Qwen3VLProcessor:
         Returns:
             ProcessorOutput with input_ids, pixel_values, image_grid_thw.
         """
+        total_start = time.perf_counter()
         images: List[Image.Image] = []
         # Build a messages list compatible with processor.apply_chat_template
         processed_messages: List[Dict[str, Any]] = []
@@ -61,13 +66,20 @@ class Qwen3VLProcessor:
             processed_messages.append({"role": role, "content": parts})
 
         # Use processor to generate text from chat template
+        template_start = time.perf_counter()
         text = self.processor.apply_chat_template(
             processed_messages,
             tokenize=False,
             add_generation_prompt=True,
         )
+        maybe_log_perf(
+            logger,
+            f"qwen3_vl.apply_chat_template messages={len(processed_messages)} images={len(images)}",
+            template_start,
+        )
 
         # Call processor with images + text
+        processor_start = time.perf_counter()
         if images:
             inputs = self.processor(
                 images=images,
@@ -79,6 +91,11 @@ class Qwen3VLProcessor:
                 text=text,
                 return_tensors="pt",
             )
+        maybe_log_perf(
+            logger,
+            f"qwen3_vl.hf_processor images={len(images)} prompt_chars={len(text)}",
+            processor_start,
+        )
 
         input_ids = inputs["input_ids"].squeeze(0).to(torch.int32)
         pixel_values = inputs.get("pixel_values", None)
@@ -91,6 +108,11 @@ class Qwen3VLProcessor:
                 image_grid_thw.squeeze(0) if image_grid_thw.dim() > 2 else image_grid_thw
             )
 
+        maybe_log_perf(
+            logger,
+            f"qwen3_vl.process_messages images={len(images)} tokens={input_ids.numel()}",
+            total_start,
+        )
         return ProcessorOutput(
             input_ids=input_ids,
             pixel_values=pixel_values,

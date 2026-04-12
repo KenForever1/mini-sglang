@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 import torch
 from minisgl.core import get_global_ctx
 from minisgl.layers import ParallelLMHead, VocabParallelEmbedding
 from minisgl.layers.vision import Qwen3VLVisionModel
+from minisgl.utils import init_logger, maybe_log_perf
 
 from .base import BaseLLMModel
 from .qwen3 import Qwen3Model
 
 if TYPE_CHECKING:
     from .config import ModelConfig
+
+logger = init_logger(__name__)
 
 
 class Qwen3VLForConditionalGeneration(BaseLLMModel):
@@ -52,6 +56,7 @@ class Qwen3VLForConditionalGeneration(BaseLLMModel):
         return input_embeds, deepstack_embeds
 
     def forward(self) -> torch.Tensor:
+        total_start = time.perf_counter()
         ctx = get_global_ctx()
         batch = ctx.batch
         input_ids = batch.input_ids
@@ -69,7 +74,14 @@ class Qwen3VLForConditionalGeneration(BaseLLMModel):
 
             if mask.any() and batch.pixel_values is not None:
                 # Run vision encoder only when there are image tokens to fill
+                vision_start = time.perf_counter()
                 image_embeds = self.visual(batch.pixel_values, batch.image_grid_thw)
+                maybe_log_perf(
+                    logger,
+                    f"qwen3_vl.visual_encode image_count={batch.image_grid_thw.shape[0]} image_tokens={int(mask.sum().item())}",
+                    vision_start,
+                    rank0=True,
+                )
                 vision_embeds, deepstack_embeds = self._separate_deepstack_embeds(image_embeds)
 
                 hidden[mask] = vision_embeds.to(hidden.dtype)
@@ -84,17 +96,31 @@ class Qwen3VLForConditionalGeneration(BaseLLMModel):
                     input_deepstack_embeds[mask] = deepstack_embeds.to(hidden.dtype)
 
             # Forward through decoder (MRoPE positions are still used correctly)
+            decoder_start = time.perf_counter()
             output = self.model.forward(
                 input_ids,
                 inputs_embeds=hidden,
                 deepstack_embeds=input_deepstack_embeds,
                 deepstack_inject_layers=self.deepstack_inject_layers,
             )
+            maybe_log_perf(
+                logger,
+                f"qwen3_vl.decoder_prefill tokens={input_ids.numel()}",
+                decoder_start,
+                rank0=True,
+            )
         else:
             # Text-only or decode phase: standard path
             output = self.model.forward(input_ids)
 
         logits = self.lm_head.forward(output)
+        if batch.has_multimodal and batch.is_prefill:
+            maybe_log_perf(
+                logger,
+                f"qwen3_vl.forward_prefill tokens={input_ids.numel()} batch={batch.size}",
+                total_start,
+                rank0=True,
+            )
         return logits
 
 

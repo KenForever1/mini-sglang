@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass
+import time
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.distributed import get_tp_info
-from minisgl.utils import init_logger
+from minisgl.utils import init_logger, maybe_log_perf
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -103,6 +104,7 @@ class GraphRunner:
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
+        capture_start = time.perf_counter()
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
@@ -127,6 +129,7 @@ class GraphRunner:
         )
         pool = None
         for bs in pbar:
+            graph_start = time.perf_counter()
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
@@ -142,9 +145,16 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            maybe_log_perf(logger, f"graph.capture_bs={bs}", graph_start, rank0=True)
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        maybe_log_perf(
+            logger,
+            f"graph.capture_total count={len(self.graph_bs_list)} max_bs={self.max_graph_bs}",
+            capture_start,
+            rank0=True,
+        )
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs and not batch.has_multimodal

@@ -207,3 +207,14 @@ Scheduler 每 N 步打印 KV cache 状态：
 | `scheduler/cache.py` | CacheManager（分配/释放/ensure_batch_on_gpu/LocationTable 状态管理） |
 | `attention/fi.py` | FlashInfer attention forward 中的 prefetch/wait 集成 |
 | `engine/engine.py` | TieredKVCachePool 初始化和 Layer 0 预取触发 |
+
+
+## 启动命令
+
+```bash
+开服务时打开日志：
+MINISGL_ENABLE_PROFILING_LOGS=1 MINISGL_PROFILE_LOG_MIN_MS=5 python -m minisgl.server.launch --model-path Qwen3-VL-2B-Instruct
+
+跑单图 TTFT：
+python3 benchmark/online/bench_single_image_ttft.py --image /path/to/image.jpg --runs 5 --warmup-runs 1 --max-tokens 32
+```

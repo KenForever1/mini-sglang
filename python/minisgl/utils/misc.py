@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import time
+from typing import Any
+
 
 def call_if_main(name: str = "__main__", discard: bool | None = None):
     """Decorator to ensure a function will call when the script is run as main."""
@@ -46,3 +49,30 @@ class Unset:
 
 
 UNSET = Unset()
+
+
+def profile_enabled() -> bool:
+    from minisgl.env import ENV
+
+    return ENV.ENABLE_PROFILING_LOGS.value
+
+
+def elapsed_ms(start_time: float) -> float:
+    return (time.perf_counter() - start_time) * 1000
+
+
+def maybe_log_perf(logger: Any, label: str, start_time: float, *, rank0: bool = False) -> float:
+    elapsed = elapsed_ms(start_time)
+    if not profile_enabled():
+        return elapsed
+
+    from minisgl.env import ENV
+
+    if elapsed < ENV.PROFILE_LOG_MIN_MS.value:
+        return elapsed
+
+    log_fn = getattr(logger, "info_rank0", None) if rank0 else None
+    if log_fn is None:
+        log_fn = logger.info
+    log_fn("[profile] %s took %.2f ms", label, elapsed)
+    return elapsed

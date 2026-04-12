@@ -5,12 +5,16 @@ No tensor parallelism in the first phase (TP=1 only).
 """
 from __future__ import annotations
 
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from minisgl.utils import init_logger, maybe_log_perf
+
+logger = init_logger(__name__)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -42,7 +46,14 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
-    """3D convolution patch embedding for Qwen3-VL."""
+    """3D convolution patch embedding for Qwen3-VL.
+
+    When kernel_size == stride (the default for patch embedding), the Conv3d
+    degenerates into a simple linear projection over flattened patches.  We
+    store the weight/bias in Conv3d format for checkpoint compatibility but
+    execute via F.linear to avoid cuDNN algorithm-selection overhead that can
+    take tens of seconds on the first call with a new shape.
+    """
 
     def __init__(
         self,
@@ -58,6 +69,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         kernel_size = [temporal_patch_size, patch_size, patch_size]
+        # Keep Conv3d for weight storage so existing checkpoints load directly.
         self.proj = nn.Conv3d(
             in_channels,
             embed_dim,
@@ -68,16 +80,15 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
+        # Flatten each patch into a vector: (N, C * T * H * W)
+        flat_dim = (
+            self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
         )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
+        hidden_states = hidden_states.view(-1, flat_dim).to(dtype=target_dtype)
+
+        # Conv3d weight shape: (embed_dim, C, T, H, W) → reshape to (embed_dim, flat_dim)
+        weight = self.proj.weight.view(self.embed_dim, flat_dim)
+        hidden_states = F.linear(hidden_states, weight, self.proj.bias)
         return hidden_states
 
 
@@ -443,24 +454,48 @@ class Qwen3VLVisionModel(nn.Module):
         Returns:
             (total_merged_tokens, out_hidden_size * (1 + num_deepstack))
         """
+        total_start = time.perf_counter()
+        num_images = int(grid_thw.shape[0])
         x = x.to(device=self.device, dtype=self.dtype)
         grid_thw = grid_thw.to(device=self.device)
 
         # 1. Patch embedding
+        patch_start = time.perf_counter()
         x = self.patch_embed(x)
+        maybe_log_perf(
+            logger,
+            f"vision.patch_embed images={num_images} patches={x.shape[0]}",
+            patch_start,
+            rank0=True,
+        )
 
         # 2. Absolute position embedding (bilinear interpolation)
+        pos_start = time.perf_counter()
         x = x + self._fast_pos_embed_interpolate(grid_thw)
+        maybe_log_perf(
+            logger,
+            f"vision.abs_pos_embed patches={x.shape[0]}",
+            pos_start,
+            rank0=True,
+        )
 
         # 3. Rotary position embedding for vision attention
+        prep_start = time.perf_counter()
         rot_emb = self._rot_pos_emb(grid_thw).to(x.device)
         emb = torch.cat((rot_emb, rot_emb), dim=-1)  # neox-style doubling
         position_embeddings = (emb.cos(), emb.sin())
 
         # 4. Compute cu_seqlens (each temporal frame is a separate segment)
         cu_seqlens = compute_cu_seqlens(grid_thw).to(x.device)
+        maybe_log_perf(
+            logger,
+            f"vision.position_prep segments={cu_seqlens.numel() - 1}",
+            prep_start,
+            rank0=True,
+        )
 
         # 5. Run through vision blocks, capture deepstack intermediates
+        blocks_start = time.perf_counter()
         deepstack_features = []
         ds_captured = 0
         for layer_num, blk in enumerate(self.blocks):
@@ -469,10 +504,29 @@ class Qwen3VLVisionModel(nn.Module):
                 ds_feat = self.deepstack_merger_list[ds_captured](x)
                 deepstack_features.append(ds_feat)
                 ds_captured += 1
+        maybe_log_perf(
+            logger,
+            f"vision.blocks layers={len(self.blocks)} patches={x.shape[0]}",
+            blocks_start,
+            rank0=True,
+        )
 
         # 6. Final merger
+        merger_start = time.perf_counter()
         x = self.merger(x)
 
         # 7. Concatenate with deepstack features along feature dimension
         hidden_states = torch.cat([x] + deepstack_features, dim=1)
+        maybe_log_perf(
+            logger,
+            f"vision.merge merged_tokens={hidden_states.shape[0]}",
+            merger_start,
+            rank0=True,
+        )
+        maybe_log_perf(
+            logger,
+            f"vision.forward_total images={num_images} merged_tokens={hidden_states.shape[0]}",
+            total_start,
+            rank0=True,
+        )
         return hidden_states

@@ -1,7 +1,18 @@
 from .arch import is_arch_supported, is_sm90_supported, is_sm100_supported
 from .hf import cached_load_hf_config, download_hf_weight, load_processor, load_tokenizer
 from .logger import init_logger
-from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even
+from .misc import (
+    UNSET,
+    Unset,
+    align_ceil,
+    align_down,
+    call_if_main,
+    div_ceil,
+    div_even,
+    elapsed_ms,
+    maybe_log_perf,
+    profile_enabled,
+)
 from .mp import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -27,6 +38,9 @@ __all__ = [
     "div_ceil",
     "align_ceil",
     "align_down",
+    "elapsed_ms",
+    "maybe_log_perf",
+    "profile_enabled",
     "UNSET",
     "Unset",
     "torch_dtype",

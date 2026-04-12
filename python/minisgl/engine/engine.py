@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import time
 from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
@@ -11,7 +12,14 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
-from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from minisgl.utils import (
+    div_even,
+    init_logger,
+    is_sm90_supported,
+    is_sm100_supported,
+    maybe_log_perf,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -28,6 +36,7 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: EngineConfig):
+        init_start = time.perf_counter()
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
@@ -41,20 +50,27 @@ class Engine:
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
+        comm_start = time.perf_counter()
         self.tp_cpu_group = self._init_communication(config)
+        maybe_log_perf(logger, "engine.init_communication", comm_start, rank0=True)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
+        model_init_start = time.perf_counter()
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        weight_load_start = time.perf_counter()
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        maybe_log_perf(logger, "engine.load_weights", weight_load_start, rank0=True)
+        maybe_log_perf(logger, "engine.init_model", model_init_start, rank0=True)
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
 
+        kv_init_start = time.perf_counter()
         if config.cpu_kv_cache_gb > 0:
             # Tiered KV cache: GPU + CPU (+ optional SSD)
             from minisgl.kvcache.eviction import TieredEvictionPolicy
@@ -94,6 +110,7 @@ class Engine:
                 device=self.device,
                 dtype=self.dtype,
             )
+        maybe_log_perf(logger, "engine.init_kv_cache", kv_init_start, rank0=True)
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -106,11 +123,13 @@ class Engine:
         )
 
         # ======================= Attention & MoE backend initialization ========================
+        backend_init_start = time.perf_counter()
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+        maybe_log_perf(logger, "engine.init_backends", backend_init_start, rank0=True)
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -129,6 +148,7 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        graph_init_start = time.perf_counter()
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -141,6 +161,8 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
+        maybe_log_perf(logger, "engine.init_cuda_graphs", graph_init_start, rank0=True)
+        maybe_log_perf(logger, "engine.init_total", init_start, rank0=True)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -222,6 +244,7 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        total_start = time.perf_counter()
         assert torch.cuda.current_stream() == self.stream
 
         # Tiered KV cache: prefetch Layer 0 before the model starts
@@ -231,19 +254,39 @@ class Engine:
             page_ids = self.attn_backend._collect_page_ids(batch)
             self.kv_cache.prefetch_scheduler.prefetch_layer(0, page_ids)
 
+        model_start = time.perf_counter()
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+        maybe_log_perf(
+            logger,
+            f"engine.model_forward phase={batch.phase} size={batch.size} multimodal={batch.has_multimodal}",
+            model_start,
+            rank0=True,
+        )
 
         for req in batch.reqs:
             req.complete_one()
 
+        sample_start = time.perf_counter()
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        maybe_log_perf(
+            logger,
+            f"engine.sample_and_copy phase={batch.phase} size={batch.size}",
+            sample_start,
+            rank0=True,
+        )
+        maybe_log_perf(
+            logger,
+            f"engine.forward_batch_total phase={batch.phase} size={batch.size} multimodal={batch.has_multimodal}",
+            total_start,
+            rank0=True,
+        )
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
